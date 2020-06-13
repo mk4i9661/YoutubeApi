@@ -16,111 +16,209 @@ namespace YoutubeApi
         static readonly string[] Scopes = { YouTubeService.Scope.Youtube };
 
         [STAThread]
-        static void Main(string[] args) {
-            try {
-                new Program().Run();
-            } catch (AggregateException ex) {
-                foreach (var e in ex.InnerExceptions) {
-                    Console.WriteLine("ERROR: " + e.Message);
+        static void Main(string[] args)
+        {
+            try
+            {
+                new Program().Run(args);
+            }
+            catch (AggregateException ex)
+            {
+                foreach (var e in ex.InnerExceptions)
+                {
+                    Console.Error.WriteLine("ERROR: " + e.Message);
                 }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("ERROR: " + ex.Message);
             }
             Console.WriteLine("Press any key to continue...");
             Console.ReadKey();
         }
 
-        IEnumerable<Playlist> GetMinePlaylists(YouTubeService service) {
+        class ServiceCollection
+        {
+            private String[] SecretsCollection
+            {
+                get;
+                set;
+            }
+
+            private int currentServiceIndex;
+            private YouTubeService service;
+
+            public ServiceCollection(string[] secretsCollection)
+            {
+                SecretsCollection = secretsCollection;
+                currentServiceIndex = 0;
+            }
+
+            private YouTubeService CreateService()
+            {
+                if (currentServiceIndex + 1 > SecretsCollection.Length)
+                {
+                    throw new Exception("No more API keys left.");
+                }
+                var fileSecret = new FileInfo(SecretsCollection[currentServiceIndex++]);
+                using (var stream = fileSecret.OpenRead())
+                {
+                    var credPath = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.Personal),
+                        string.Format(".credentials/{0}", fileSecret.Name)
+                        );
+
+                    var credential = GoogleWebAuthorizationBroker.AuthorizeAsync(
+                        GoogleClientSecrets.Load(stream).Secrets,
+                        Scopes,
+                        "user",
+                        CancellationToken.None,
+                        new FileDataStore(credPath, true)).Result;
+                    Console.WriteLine("Credential file saved to: " + credPath);
+
+                    return new YouTubeService(new BaseClientService.Initializer()
+                    {
+                        HttpClientInitializer = credential,
+                        ApplicationName = "YoutubeApiTest"
+                    });
+                }
+            }
+
+            public void ChooseNextService()
+            {
+                service = CreateService();
+            }
+
+            public YouTubeService CurrentService
+            {
+                get
+                {
+                    if (service == null)
+                    {
+                        ChooseNextService();
+                    }
+                    return service;
+                }
+            }
+        }
+
+        private T Retry<T>(ServiceCollection collection, Func<YouTubeService, T> requestToMake)
+        {
+            try
+            {
+                return requestToMake(collection.CurrentService);
+            }
+            catch (Google.GoogleApiException exception)
+            {
+                var youtubeError = exception.Error.Errors.FirstOrDefault();
+                if (youtubeError != null)
+                {
+                    if (string.Equals("youtube.quota", youtubeError.Domain, StringComparison.InvariantCultureIgnoreCase))
+                    {
+                        Console.Error.WriteLine("It seems that the request quota has been met. Trying another API key...");
+                        collection.ChooseNextService();
+                        return Retry(collection, requestToMake);
+                    }
+                }
+                throw;
+            }
+        }
+
+        IEnumerable<Playlist> GetMinePlaylists(ServiceCollection collection)
+        {
             var result = new List<Playlist>();
 
             string token = "";
-            while (token != null) {
-                var request = service.Playlists.List("id,snippet");
-                request.Mine = true;
-                request.PageToken = token;
-                request.MaxResults = 50;
-                var resultResult = request.Execute();
-                token = resultResult.NextPageToken;
-                result.AddRange(resultResult.Items);
+            while (token != null)
+            {
+                var requestResult = Retry(collection, service =>
+                {
+                    var request = service.Playlists.List("id,snippet");
+                    request.Mine = true;
+                    request.PageToken = token;
+                    request.MaxResults = 50;
+                    return request.Execute();
+                });
+                token = requestResult.NextPageToken;
+                result.AddRange(requestResult.Items);
             }
 
             return result;
         }
 
-        IEnumerable<PlaylistItem> GetPlaylistItems(YouTubeService service, Playlist playlist) {
+        IEnumerable<PlaylistItem> GetPlaylistItems(ServiceCollection collection, Playlist playlist)
+        {
             var result = new List<PlaylistItem>();
 
             string token = "";
-            while (token != null) {
-                var request = service.PlaylistItems.List("id,snippet,contentDetails");
-                request.PlaylistId = playlist.Id;
-                request.PageToken = token;
-                request.MaxResults = 50;
-                var resultResult = request.Execute();
-                token = resultResult.NextPageToken;
-                result.AddRange(resultResult.Items);
+            while (token != null)
+            {
+                var requetResult = Retry(collection, service =>
+                {
+                    var request = service.PlaylistItems.List("id,snippet,contentDetails");
+                    request.PlaylistId = playlist.Id;
+                    request.PageToken = token;
+                    request.MaxResults = 50;
+                    return request.Execute();
+                });
+                token = requetResult.NextPageToken;
+                result.AddRange(requetResult.Items);
             }
 
             return result;
         }
 
-        void UpdateNote(YouTubeService service, PlaylistItem item) {
+        void UpdateNote(ServiceCollection collection, PlaylistItem item)
+        {
             var updatedItem = new PlaylistItem();
             updatedItem.Id = item.Id;
-            updatedItem.Snippet = new PlaylistItemSnippet() {
+            updatedItem.Snippet = new PlaylistItemSnippet()
+            {
                 PlaylistId = item.Snippet.PlaylistId,
                 ResourceId = item.Snippet.ResourceId,
             };
-            //updatedItem.Snippet
 
-            updatedItem.ContentDetails = new PlaylistItemContentDetails() {
+            updatedItem.ContentDetails = new PlaylistItemContentDetails()
+            {
                 Note = item.Snippet.Title
             };
 
-            var request = service.PlaylistItems.Update(updatedItem, "id,snippet,contentDetails");
-            request.Fields = "id,snippet/playlistId,snippet/resourceId,contentDetails/note";
-            try {
-                request.Execute();
-            } catch (Exception exception) {
-                Console.WriteLine("An error occured while processsing playlist item. Id: {0}. Exception: {1}{2}", item.Id, Environment.NewLine, exception.Message);
+            try
+            {
+                Retry(collection, service =>
+                {
+                    var request = service.PlaylistItems.Update(updatedItem, "id,snippet,contentDetails");
+                    request.Fields = "id,snippet/playlistId,snippet/resourceId,contentDetails/note";
+                    return request.Execute();
+                });
+            }
+            catch (Google.GoogleApiException exception)
+            {
+                Console.Error.WriteLine("An error occured while processsing playlist item. Id: {0}. Exception: {1}{2}", item.Id, Environment.NewLine, exception.Message);
             }
         }
 
-        private void Run() {
-            UserCredential credential;
+        private void Run(string[] credentialsToUse)
+        {
+            var collection = new ServiceCollection(credentialsToUse);
 
-
-            using (var stream = new MemoryStream(Properties.Resources.client_secret)) {
-                string credPath = System.Environment.GetFolderPath(
-                    System.Environment.SpecialFolder.Personal);
-                credPath = Path.Combine(credPath, ".credentials/youtube-api-test.json");
-
-                credential = GoogleWebAuthorizationBroker.AuthorizeAsync(
-                    GoogleClientSecrets.Load(stream).Secrets,
-                    Scopes,
-                    "user",
-                    CancellationToken.None,
-                    new FileDataStore(credPath, true)).Result;
-                Console.WriteLine("Credential file saved to: " + credPath);
-            }
-
-            var youtube = new YouTubeService(new BaseClientService.Initializer() {
-                HttpClientInitializer = credential,
-                ApplicationName = "YoutubeApiTest"
-            });
-
-            var playlists = GetMinePlaylists(youtube).ToArray();
+            var playlists = GetMinePlaylists(collection).ToArray();
 
 
             Console.WriteLine("Total playlist to process: {0}", playlists.Length);
-            foreach (var playlist in playlists) {
+            foreach (var playlist in playlists)
+            {
                 Console.WriteLine("Processing playlist: {0}", playlist.Snippet.Title);
-                var items = GetPlaylistItems(youtube, playlist).ToArray();
+                var items = GetPlaylistItems(collection, playlist).ToArray();
                 Console.WriteLine("Total items: {0}", items.Length);
-                foreach (var item in items) {
+                foreach (var item in items)
+                {
                     Console.WriteLine("Processing playlist item: {0}", item.Snippet.Title);
-                    if (!string.IsNullOrEmpty(item.ContentDetails.Note)) {
+                    if (!string.IsNullOrEmpty(item.ContentDetails.Note))
+                    {
                         continue;
                     }
-                    UpdateNote(youtube, item);
+                    UpdateNote(collection, item);
                 }
                 Console.WriteLine("__________");
             }
